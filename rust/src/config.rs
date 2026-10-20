@@ -5,6 +5,7 @@
 //! remote, is read with the same schema, unknown fields being an error as with pydantic.
 
 use anyhow::{Context, Result, bail};
+pub use ptts::flow_lm::FlowType;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -15,12 +16,9 @@ include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
 pub struct FlowConfig {
     pub dim: usize,
     pub depth: usize,
-    #[serde(rename = "type", default = "default_flow_type")]
-    pub kind: String,
-}
-
-fn default_flow_type() -> String {
-    "lsd".to_string()
+    /// The sampler head, under the names pocket-tts gives them.
+    #[serde(rename = "type", default)]
+    pub kind: FlowType,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -31,12 +29,31 @@ pub struct FlowLMTransformerConfig {
     pub d_model: usize,
     pub num_heads: usize,
     pub num_layers: usize,
-    #[serde(default)]
-    pub dim_feedforward: Option<usize>,
+    /// Width of the queries and of the attention output, `d_model` when `None`.
     #[serde(default)]
     pub attn_dim: Option<usize>,
+    /// Key/value heads, each shared by `num_heads / num_kv_heads` query heads, `num_heads` when
+    /// `None`.
     #[serde(default)]
     pub num_kv_heads: Option<usize>,
+    /// Hidden width of the feed-forward layers, `d_model * hidden_scale` when `None`.
+    #[serde(default)]
+    pub dim_feedforward: Option<usize>,
+}
+
+impl FlowLMTransformerConfig {
+    pub fn num_kv_heads(&self) -> usize {
+        self.num_kv_heads.unwrap_or(self.num_heads)
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.attn_dim.unwrap_or(self.d_model) / self.num_heads
+    }
+
+    pub fn dim_feedforward(&self) -> usize {
+        self.dim_feedforward
+            .unwrap_or(self.d_model * self.hidden_scale)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,6 +63,7 @@ pub struct LookupTable {
     pub n_bins: usize,
     pub tokenizer: String,
     pub tokenizer_path: String,
+    /// A low-rank table: `rank`-wide embeddings and a bias-free projection to `dim`.
     #[serde(default)]
     pub rank: Option<usize>,
 }
@@ -63,6 +81,8 @@ pub struct FlowLMConfig {
     pub weights_path: Option<String>,
     #[serde(default)]
     pub insert_bos_before_voice: bool,
+    /// Width of the backbone output the sampler and EOS heads read: a bias-free projection from
+    /// `d_model` when set.
     #[serde(default)]
     pub z_dim: Option<usize>,
 }
@@ -127,10 +147,28 @@ pub struct MimiConfig {
     pub inner_dim: Option<usize>,
     #[serde(default)]
     pub outer_dim: Option<usize>,
+    /// The decoder's SEANet and transformer, when they differ from the encoder's.
     #[serde(default)]
     pub decoder_seanet: Option<SEANetConfig>,
     #[serde(default)]
     pub decoder_transformer: Option<MimiTransformerConfig>,
+}
+
+impl MimiConfig {
+    pub fn decoder_seanet(&self) -> &SEANetConfig {
+        self.decoder_seanet.as_ref().unwrap_or(&self.seanet)
+    }
+
+    pub fn decoder_transformer(&self) -> &MimiTransformerConfig {
+        self.decoder_transformer
+            .as_ref()
+            .unwrap_or(&self.transformer)
+    }
+
+    /// Whether the decoder has its own dims, which xn-ptts then loads with a config of its own.
+    fn has_own_decoder(&self) -> bool {
+        self.decoder_seanet.is_some() || self.decoder_transformer.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,10 +195,9 @@ pub struct Config {
     pub model_recommended_frames_after_eos: Option<usize>,
     #[serde(default = "default_temperature")]
     pub default_temperature: f32,
-    /// Unused: only the small models set it, and they are rejected until xn-ptts supports them.
-    #[allow(dead_code)]
-    #[serde(default)]
-    pub default_eos_threshold: Option<f32>,
+    /// The EOS threshold when the caller does not pass one.
+    #[serde(default = "default_eos_threshold")]
+    pub default_eos_threshold: f32,
 }
 
 fn default_true() -> bool {
@@ -171,15 +208,8 @@ fn default_temperature() -> f32 {
     0.3
 }
 
-/// The sampler head of the flow LM, from the config's `flow.type`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FlowType {
-    /// Lagrangian Self Distillation: two time conditions.
-    Lsd,
-    /// Optimal-transport flow matching: one time condition, Euler integration.
-    FlowMatching,
-    /// No time condition, the head maps the noise to a sample in one step.
-    Drifting,
+fn default_eos_threshold() -> f32 {
+    crate::defaults::DEFAULT_EOS_THRESHOLD
 }
 
 /// Where a config came from.
@@ -258,66 +288,57 @@ impl Config {
         Ok((config, origin))
     }
 
-    pub fn flow_type(&self) -> Result<FlowType> {
-        match self.flow_lm.flow.kind.as_str() {
-            "lsd" => Ok(FlowType::Lsd),
-            "flow_matching" => Ok(FlowType::FlowMatching),
-            "drifting" => Ok(FlowType::Drifting),
-            other => bail!("Unknown flow type: {other}"),
-        }
-    }
-
-    /// The width of the speaker latents, which the Mimi encoder's downsampling produces.
-    pub fn speaker_latent_dim(&self) -> usize {
-        self.mimi.inner_dim.unwrap_or(self.mimi.seanet.dimension)
+    pub fn flow_type(&self) -> FlowType {
+        self.flow_lm.flow.kind
     }
 
     /// The configuration is checked up front against what xn-ptts can run, so that a model it
     /// cannot represent fails with an explanation rather than a shape mismatch.
     fn validate(&self) -> Result<()> {
-        // TODO: upstream to xn-ptts (gradium-ai/xn-ptts#210), then translate these fields.
-        let flow_lm = &self.flow_lm;
-        let transformer = &flow_lm.transformer;
-        if flow_lm.flow.kind == "pointwise"
-            || flow_lm.z_dim.is_some()
-            || flow_lm.lookup_table.rank.is_some()
-            || transformer.dim_feedforward.is_some()
-            || transformer.attn_dim.is_some()
-            || transformer.num_kv_heads.is_some()
-            || self.mimi.decoder_seanet.is_some()
-            || self.mimi.decoder_transformer.is_some()
-        {
-            bail!(
-                "this model uses small-model options (pointwise head, z_dim, attn_dim, num_kv_heads, \
-                 a low-rank text table, an explicit feed-forward width or a separate Mimi decoder) \
-                 that the pinned xn-ptts does not support yet"
-            )
-        }
-        self.flow_type()?;
         let mimi = &self.mimi;
-        let dimension = mimi.seanet.dimension;
-        // TODO: upstream to xn-ptts. Its Mimi decoder upsamples from `dimension` channels; an
-        // `outer_dim` (the `in_dimension` of `ConvTrUpsample1d`) other than that needs support
-        // in `MimiConfig`.
+        let decoder_dimension = mimi.decoder_seanet().dimension;
+        // TODO: upstream to xn-ptts. Its Mimi decoder upsamples from as many channels as it
+        // decodes; an `outer_dim` (the `in_dimension` of `ConvTrUpsample1d`) other than that
+        // needs support in `MimiConfig`.
         if mimi
             .outer_dim
-            .is_some_and(|outer_dim| outer_dim != dimension)
+            .is_some_and(|outer_dim| outer_dim != decoder_dimension)
         {
-            bail!("mimi.outer_dim different from mimi.seanet.dimension is not supported")
+            bail!("mimi.outer_dim different from the decoder's seanet dimension is not supported")
         }
-        // TODO: upstream to xn-ptts. Its SEANet always pads with zeros.
-        if mimi.seanet.pad_mode != "constant" {
-            bail!(
-                "mimi.seanet.pad_mode {:?} is not supported",
-                mimi.seanet.pad_mode
-            )
+        for (name, seanet) in [
+            ("seanet", &mimi.seanet),
+            ("decoder_seanet", mimi.decoder_seanet()),
+        ] {
+            // TODO: upstream to xn-ptts. Its SEANet always pads with zeros.
+            if seanet.pad_mode != "constant" {
+                bail!(
+                    "mimi.{name}.pad_mode {:?} is not supported",
+                    seanet.pad_mode
+                )
+            }
+            if seanet.channels != 1 {
+                bail!("only mono Mimi models are supported")
+            }
         }
-        if mimi.transformer.input_dimension != dimension
-            || mimi.transformer.output_dimensions != [dimension]
-        {
-            bail!("the Mimi transformer must map mimi.seanet.dimension to itself")
+        if mimi.decoder_seanet().ratios != mimi.seanet.ratios {
+            bail!("mimi.decoder_seanet.ratios must be those of mimi.seanet")
         }
-        if mimi.channels != 1 || mimi.seanet.channels != 1 {
+        for (name, transformer, dimension) in [
+            ("transformer", &mimi.transformer, mimi.seanet.dimension),
+            (
+                "decoder_transformer",
+                mimi.decoder_transformer(),
+                decoder_dimension,
+            ),
+        ] {
+            if transformer.input_dimension != dimension
+                || transformer.output_dimensions != [dimension]
+            {
+                bail!("mimi.{name} must map its seanet dimension to itself")
+            }
+        }
+        if mimi.channels != 1 {
             bail!("only mono Mimi models are supported")
         }
         for key in self.replace_characters.keys() {
@@ -326,6 +347,43 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// The `MimiConfig` of xn-ptts for a SEANet and a transformer of `self.mimi`.
+    fn mimi_to_ptts(
+        &self,
+        seanet: &SEANetConfig,
+        transformer: &MimiTransformerConfig,
+    ) -> serde_json::Value {
+        let mimi = &self.mimi;
+        serde_json::json!({
+            "channels": mimi.channels,
+            "sample_rate": mimi.sample_rate,
+            "frame_rate": mimi.frame_rate,
+            "dimension": seanet.dimension,
+            "quantizer_dimension": mimi.quantizer.dimension,
+            "quantizer_output_dimension": mimi.quantizer.output_dimension,
+            "n_filters": seanet.n_filters,
+            "n_residual_layers": seanet.n_residual_layers,
+            "ratios": seanet.ratios,
+            "kernel_size": seanet.kernel_size,
+            "last_kernel_size": seanet.last_kernel_size,
+            "residual_kernel_size": seanet.residual_kernel_size,
+            "dilation_base": seanet.dilation_base,
+            "compress": seanet.compress,
+            "transformer_d_model": transformer.d_model,
+            "transformer_num_heads": transformer.num_heads,
+            "transformer_num_layers": transformer.num_layers,
+            "transformer_layer_scale": transformer.layer_scale,
+            // pocket-tts (and moshi) count the current key in the `context` keys a query attends
+            // to, where xn-ptts counts the `context` positions before it: one less is the same
+            // window.
+            "transformer_context": transformer.context.saturating_sub(1),
+            "transformer_max_period": transformer.max_period,
+            "transformer_dim_feedforward": transformer.dim_feedforward,
+            "downsample_channel_wise": false,
+            "inner_dim": mimi.inner_dim,
+        })
     }
 
     /// The `config.json` of xn-ptts that describes the same model.
@@ -341,45 +399,32 @@ impl Config {
                 "d_model": flow_lm.transformer.d_model,
                 "num_heads": flow_lm.transformer.num_heads,
                 "num_layers": flow_lm.transformer.num_layers,
-                "dim_feedforward": flow_lm.transformer.d_model * flow_lm.transformer.hidden_scale,
+                "dim_feedforward": flow_lm.transformer.dim_feedforward(),
                 "max_period": flow_lm.transformer.max_period,
                 "n_bins": flow_lm.lookup_table.n_bins,
                 "lut_dim": flow_lm.lookup_table.dim,
                 "flow_dim": flow_lm.flow.dim,
                 "flow_depth": flow_lm.flow.depth,
                 "ldim": mimi.quantizer.dimension,
+                "flow_type": flow_lm.flow.kind,
+                "z_dim": flow_lm.z_dim,
+                "attn_dim": flow_lm.transformer.attn_dim,
+                "num_kv_heads": flow_lm.transformer.num_kv_heads,
+                "lut_rank": flow_lm.lookup_table.rank,
             },
-            "mimi": {
-                "channels": mimi.channels,
-                "sample_rate": mimi.sample_rate,
-                "frame_rate": mimi.frame_rate,
-                "dimension": mimi.seanet.dimension,
-                "quantizer_dimension": mimi.quantizer.dimension,
-                "quantizer_output_dimension": mimi.quantizer.output_dimension,
-                "n_filters": mimi.seanet.n_filters,
-                "n_residual_layers": mimi.seanet.n_residual_layers,
-                "ratios": mimi.seanet.ratios,
-                "kernel_size": mimi.seanet.kernel_size,
-                "last_kernel_size": mimi.seanet.last_kernel_size,
-                "residual_kernel_size": mimi.seanet.residual_kernel_size,
-                "dilation_base": mimi.seanet.dilation_base,
-                "compress": mimi.seanet.compress,
-                "transformer_d_model": mimi.transformer.d_model,
-                "transformer_num_heads": mimi.transformer.num_heads,
-                "transformer_num_layers": mimi.transformer.num_layers,
-                "transformer_layer_scale": mimi.transformer.layer_scale,
-                // TODO: upstream to xn-ptts. Its Mimi attention reaches `context` positions back,
-                // which is `context + 1` keys with the current one, where pocket-tts (and moshi)
-                // attend to `context` keys in all. One less gives the same window.
-                "transformer_context": mimi.transformer.context.saturating_sub(1),
-                "transformer_max_period": mimi.transformer.max_period,
-                "transformer_dim_feedforward": mimi.transformer.dim_feedforward,
-                "downsample_channel_wise": false,
-            },
+            "mimi": self.mimi_to_ptts(mimi.decoder_seanet(), mimi.decoder_transformer()),
             "lsd_decode_steps": sampler_decode_steps,
             "eos_threshold": eos_threshold,
             "model_id": null,
         });
+        if mimi.has_own_decoder() {
+            // xn-ptts encodes the voice prompt with `speaker_mimi` when it is set and decodes
+            // with `mimi`: the encoder's config goes there, under the same weight prefix.
+            config["speaker_mimi"] = serde_json::json!({
+                "prefix": "mimi",
+                "mimi": self.mimi_to_ptts(&mimi.seanet, &mimi.transformer),
+            });
+        }
         if flow_lm.insert_bos_before_voice {
             // pocket-tts prepends `bos_before_voice` to the voice embedding, which is what a
             // `speaker_wavs` prefix sink does in xn-ptts: `[empty text, sink, voice]`. The check
@@ -396,30 +441,75 @@ impl Config {
 mod tests {
     use super::*;
 
-    /// Embedded configs the pinned xn-ptts cannot run yet; they must fail with an explanation.
-    const SMALL_MODELS: [&str; 6] = [
-        "english_18m_2026-10",
-        "english_18m_refl_2026-10",
-        "english_7m_2026-10",
-        "english_7m_refl_2026-10",
-        "english_2m_2026-10",
-        "english_2m_refl_2026-10",
-    ];
-
     #[test]
     fn every_embedded_config_parses_and_translates() {
         for (name, yaml) in CONFIGS {
-            if SMALL_MODELS.contains(name) {
-                let err = Config::parse(yaml).expect_err(name).to_string();
-                assert!(err.contains("small-model options"), "{name}: {err}");
-                continue;
-            }
             let config = Config::parse(yaml).unwrap_or_else(|e| panic!("{name}: {e:#}"));
             config
                 .to_ptts(1, -4.0)
                 .unwrap_or_else(|e| panic!("{name}: {e:#}"));
         }
         assert!(available_languages().contains(&"english"));
+    }
+
+    fn english_with(extra: &str) -> Result<Config> {
+        let (_, yaml) = CONFIGS.iter().find(|(name, _)| *name == "english").unwrap();
+        Config::parse(&format!("{yaml}\n{extra}\n"))
+    }
+
+    #[test]
+    fn the_eos_threshold_defaults_to_the_python_one() {
+        let config = english_with("").unwrap();
+        assert_eq!(
+            config.default_eos_threshold,
+            crate::defaults::DEFAULT_EOS_THRESHOLD
+        );
+        let config = english_with("default_eos_threshold: -1.0").unwrap();
+        assert_eq!(config.default_eos_threshold, -1.0);
+    }
+
+    #[test]
+    fn the_small_model_options_reach_xn_ptts() {
+        let (_, yaml) = CONFIGS.iter().find(|(name, _)| *name == "english").unwrap();
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let options = serde_yaml::from_str::<serde_yaml::Value>(
+            "{type: pointwise, attn_dim: 192, num_kv_heads: 1, dim_feedforward: 96, rank: 32}",
+        )
+        .unwrap();
+        let flow_lm = &mut value["flow_lm"];
+        flow_lm["flow"]["type"] = options["type"].clone();
+        flow_lm["z_dim"] = 64.into();
+        for key in ["attn_dim", "num_kv_heads", "dim_feedforward"] {
+            flow_lm["transformer"][key] = options[key].clone();
+        }
+        flow_lm["lookup_table"]["rank"] = options["rank"].clone();
+        let mut decoder_seanet = value["mimi"]["seanet"].clone();
+        decoder_seanet["dimension"] = 128.into();
+        value["mimi"]["decoder_seanet"] = decoder_seanet;
+        value["mimi"]["decoder_transformer"] = serde_yaml::from_str(
+            "{d_model: 128, num_heads: 4, num_layers: 4, layer_scale: 0.01, context: 50, \
+             dim_feedforward: 384, input_dimension: 128, output_dimensions: [128]}",
+        )
+        .unwrap();
+        value["mimi"]["outer_dim"] = 128.into();
+
+        let config = Config::parse(&serde_yaml::to_string(&value).unwrap()).unwrap();
+        let ptts = config.to_ptts(1, -1.0).unwrap();
+        let f = &ptts.flow_lm;
+        assert_eq!(f.flow_type, FlowType::Pointwise);
+        assert_eq!(
+            (f.z_dim, f.attn_dim, f.num_kv_heads),
+            (Some(64), Some(192), Some(1))
+        );
+        assert_eq!((f.dim_feedforward, f.lut_rank), (96, Some(32)));
+        // The decoder's dims go to `mimi`, the encoder's to `speaker_mimi`.
+        assert_eq!(ptts.mimi.dimension, 128);
+        assert_eq!(ptts.mimi.transformer_context, 49);
+        let speaker_mimi = ptts.speaker_mimi.as_ref().unwrap();
+        assert_eq!(
+            (speaker_mimi.prefix.as_str(), speaker_mimi.mimi.dimension),
+            ("mimi", 512)
+        );
     }
 
     #[test]
@@ -435,9 +525,6 @@ mod tests {
             .iter()
             .find(|(name, _)| *name == "english_drifting_26-09")
             .unwrap();
-        assert_eq!(
-            Config::parse(yaml).unwrap().flow_type().unwrap(),
-            FlowType::Drifting
-        );
+        assert_eq!(Config::parse(yaml).unwrap().flow_type(), FlowType::Drifting);
     }
 }

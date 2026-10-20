@@ -21,7 +21,7 @@ use model::{LoadOptions, TtsModel, VoiceState};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
-const LANGUAGE_HELP: &str = "Language for the TTS model. 'english_2026-01', 'english_2026-04', 'english_2026-09', 'english_2026-09_2', 'english_drifting_26-09', 'english', 'french', 'french_24l', 'german', 'german_24l', 'portuguese', 'portuguese_24l', 'italian', 'italian_24l', 'spanish', 'spanish_24l', 'dutch', 'dutch_24l'. Incompatible with the config argument. Default is 'english', which is the same model as 'english_2026-09_2'.";
+const LANGUAGE_HELP: &str = "Language for the TTS model. 'english_2026-01', 'english_2026-04', 'english_2026-09', 'english_2026-09_2', 'english_drifting_26-09', 'english_18m_2026-10', 'english_18m_refl_2026-10', 'english_7m_2026-10', 'english_7m_refl_2026-10', 'english_2m_2026-10', 'english_2m_refl_2026-10', 'english', 'french', 'french_24l', 'german', 'german_24l', 'portuguese', 'portuguese_24l', 'italian', 'italian_24l', 'spanish', 'spanish_24l', 'dutch', 'dutch_24l'. Incompatible with the config argument. Default is 'english', which is the same model as 'english_2026-09_2'.";
 const CONFIG_HELP: &str = "Path to a model config .yaml file: a local path, an https:// URL, or an hf:// path. Incompatible with the language argument. If not provided, will use the default English model.";
 
 #[derive(Parser)]
@@ -116,9 +116,9 @@ struct GenerateArgs {
     /// Noise clamp value
     #[arg(long, allow_negative_numbers = true)]
     noise_clamp: Option<f32>,
-    /// EOS threshold
-    #[arg(long, default_value_t = defaults::DEFAULT_EOS_THRESHOLD, allow_negative_numbers = true)]
-    eos_threshold: f32,
+    /// EOS threshold. Defaults to the model's value from its config (-4.0).
+    #[arg(long, allow_negative_numbers = true)]
+    eos_threshold: Option<f32>,
     /// Number of frames to generate after EOS
     #[arg(long)]
     frames_after_eos: Option<usize>,

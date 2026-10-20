@@ -7,7 +7,7 @@ use crate::defaults;
 use crate::rng::NoiseRng;
 use crate::text::{TextOptions, prepare_text_prompt, split_into_best_sentences};
 use crate::tokenizer::{SharedTokenizer, Tokenizer};
-use crate::weights::SafetensorsFile;
+use crate::weights::{SafetensorsFile, WeightFiles};
 use anyhow::{Context, Result, bail};
 use ptts::flow_lm::{FlowLMState, StepInput};
 use ptts::transformer::{LayerAttentionState, StreamingMHAState, StreamingTransformerState};
@@ -43,7 +43,8 @@ pub struct LoadOptions {
     pub temperature: Option<f32>,
     pub sampler_decode_steps: usize,
     pub noise_clamp: Option<f32>,
-    pub eos_threshold: f32,
+    /// The config's `default_eos_threshold` when `None`.
+    pub eos_threshold: Option<f32>,
 }
 
 impl Default for LoadOptions {
@@ -52,7 +53,7 @@ impl Default for LoadOptions {
             temperature: None,
             sampler_decode_steps: defaults::DEFAULT_SAMPLER_DECODE_STEPS,
             noise_clamp: None,
-            eos_threshold: defaults::DEFAULT_EOS_THRESHOLD,
+            eos_threshold: None,
         }
     }
 }
@@ -72,7 +73,7 @@ impl<Q: CpuBackend> VoiceState<Q> {
     }
 
     /// Writes the state as the Python package's `export_model_state` does: per attention layer,
-    /// `{module}/cache` of shape `[2, batch, time, heads, dim]` and `{module}/offset`.
+    /// `{module}/cache` of shape `[2, batch, time, kv_heads, dim]` and `{module}/offset`.
     pub fn export(&self, path: &Path) -> Result<()> {
         let mut tensors: Vec<(String, safetensors::Dtype, Vec<usize>, Vec<u8>)> = Vec::new();
         for (i, layer) in self.transformer_state.layer_states.iter().enumerate() {
@@ -124,40 +125,50 @@ pub struct TtsModel<Q: CpuBackend> {
     tokenizer: Arc<Tokenizer>,
     text_options: TextOptions,
     has_voice_cloning: bool,
-    flow_type: FlowType,
     rng: Mutex<NoiseRng>,
     num_layers: usize,
-    num_heads: usize,
-    d_model: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
 }
 
 impl<Q: CpuBackend> TtsModel<Q> {
     /// Port of `TTSModel.load_model`, for the config already read.
     pub fn load(config: Config, origin: Origin, options: &LoadOptions) -> Result<Self> {
-        let flow_type = config.flow_type()?;
-        // TODO: the separate FlowLM and Mimi checkpoints of training runs (weight-normed Mimi,
-        // un-renamed FlowLM keys) are not converted; export a single `weights_path` instead.
-        if config.flow_lm.weights_path.is_some() || config.mimi.weights_path.is_some() {
-            bail!(
-                "flow_lm.weights_path and mimi.weights_path are not supported by this binary, use a config with a single weights_path"
-            )
-        }
-        let Some(weights_path) = config.weights_path.as_deref() else {
-            bail!("No weights_path specified for the TTSModel, the model would be uninitialized")
-        };
-        log::info!("Loading TTSModel weights from {weights_path}");
+        let mut weight_files = WeightFiles::default();
         let mut has_voice_cloning = true;
-        let weights_file = match crate::download::download_if_necessary(weights_path) {
-            Ok(path) => path,
-            Err(e) => {
-                let Some(fallback) = config.weights_path_without_voice_cloning.as_deref() else {
-                    return Err(e);
-                };
-                log::debug!("falling back to the weights without voice cloning: {e:#}");
-                has_voice_cloning = false;
-                crate::download::download_if_necessary(fallback)?
+        if let Some(mimi_path) = config.mimi.weights_path.as_deref() {
+            if config.flow_lm.weights_path.is_none() && config.weights_path.is_none() {
+                bail!(
+                    "If you specify mimi.weights_path you should specify flow_lm.weights_path or weights_path"
+                )
             }
-        };
+            log::info!("Loading Mimi weights from {mimi_path}");
+            weight_files.mimi = Some(crate::download::download_if_necessary(mimi_path)?);
+        }
+        if let Some(weights_path) = config.weights_path.as_deref() {
+            log::info!("Loading TTSModel weights from {weights_path}");
+            let path = match crate::download::download_if_necessary(weights_path) {
+                Ok(path) => path,
+                Err(e) => {
+                    let Some(fallback) = config.weights_path_without_voice_cloning.as_deref()
+                    else {
+                        return Err(e);
+                    };
+                    log::debug!("falling back to the weights without voice cloning: {e:#}");
+                    has_voice_cloning = false;
+                    crate::download::download_if_necessary(fallback)?
+                }
+            };
+            weight_files.bundle = Some(path);
+        } else if let Some(flow_lm_path) = config.flow_lm.weights_path.as_deref() {
+            if weight_files.mimi.is_none() {
+                bail!("flow_lm.weights_path needs mimi.weights_path, for the Mimi weights")
+            }
+            log::info!("Loading FlowLM weights from {flow_lm_path}");
+            weight_files.flow_lm = Some(crate::download::download_if_necessary(flow_lm_path)?);
+        } else {
+            bail!("No weights_path specified for the TTSModel, the model would be uninitialized")
+        }
 
         let lookup_table = &config.flow_lm.lookup_table;
         let tokenizer = Arc::new(Tokenizer::load(
@@ -166,16 +177,20 @@ impl<Q: CpuBackend> TtsModel<Q> {
             &lookup_table.tokenizer,
         )?);
 
-        // The drifting head maps the noise in one step, whatever the number of steps asked.
-        let decode_steps = match flow_type {
-            FlowType::Drifting => 1,
-            _ => options.sampler_decode_steps,
+        // The drifting and pointwise heads map the noise in one step, whatever the number of
+        // steps asked.
+        let decode_steps = match config.flow_type() {
+            FlowType::Drifting | FlowType::Pointwise => 1,
+            FlowType::Lsd | FlowType::FlowMatching => options.sampler_decode_steps,
         };
         if decode_steps == 0 {
             bail!("the number of sampler decode steps must be positive")
         }
-        let ptts_config = config.to_ptts(decode_steps, options.eos_threshold)?;
-        let weights = crate::weights::load(&weights_file, &config)?;
+        let eos_threshold = options
+            .eos_threshold
+            .unwrap_or(config.default_eos_threshold);
+        let ptts_config = config.to_ptts(decode_steps, eos_threshold)?;
+        let weights = crate::weights::load(&weight_files)?;
         let model = TTSModel::<Q>::load(
             &weights.vb,
             Box::new(SharedTokenizer(tokenizer.clone())),
@@ -195,8 +210,8 @@ impl<Q: CpuBackend> TtsModel<Q> {
         let transformer = &config.flow_lm.transformer;
         Ok(Self {
             num_layers: transformer.num_layers,
-            num_heads: transformer.num_heads,
-            d_model: transformer.d_model,
+            num_kv_heads: transformer.num_kv_heads(),
+            head_dim: transformer.head_dim(),
             text_options: TextOptions::from_config(&config),
             rng: Mutex::new(NoiseRng::new(temperature, options.noise_clamp)?),
             config,
@@ -205,7 +220,6 @@ impl<Q: CpuBackend> TtsModel<Q> {
             encoder,
             tokenizer,
             has_voice_cloning,
-            flow_type,
         })
     }
 
@@ -279,7 +293,8 @@ impl<Q: CpuBackend> TtsModel<Q> {
         let voice = VoiceState {
             transformer_state: state.flow_lm_state.transformer_state,
         };
-        let size = 2 * self.num_layers * voice.len() * self.d_model * std::mem::size_of::<f32>();
+        let kv_dim = self.num_kv_heads * self.head_dim;
+        let size = 2 * self.num_layers * voice.len() * kv_dim * std::mem::size_of::<f32>();
         log::info!(
             "Size of the model state for audio prompt: {} MB",
             size / 1_000_000
@@ -290,7 +305,7 @@ impl<Q: CpuBackend> TtsModel<Q> {
     /// Reads a state written by `export-voice`, from this binary or the Python package.
     fn import_state(&self, path: &Path) -> Result<VoiceState<Q>> {
         let file = SafetensorsFile::open(path)?;
-        let dim_per_head = self.d_model / self.num_heads;
+        let dim_per_head = self.head_dim;
         let mut layer_states = Vec::with_capacity(self.num_layers);
         for i in 0..self.num_layers {
             let module = format!("transformer.layers.{i}.self_attn");
@@ -305,10 +320,10 @@ impl<Q: CpuBackend> TtsModel<Q> {
             let [2, b, capacity, h, d] = shape[..] else {
                 bail!("{cache_name} has shape {shape:?}, expected [2, batch, time, heads, dim]")
             };
-            if b != 1 || h != self.num_heads || d != dim_per_head {
+            if b != 1 || h != self.num_kv_heads || d != dim_per_head {
                 bail!(
                     "{cache_name} has shape {shape:?}, this model needs [2, 1, _, {}, {dim_per_head}]",
-                    self.num_heads
+                    self.num_kv_heads
                 )
             }
             // States written before the offset was stored hold the position in the length of
@@ -463,13 +478,7 @@ impl<Q: CpuBackend> TtsModel<Q> {
             };
             let (latent, is_eos) = {
                 let mut rng = self.rng.lock().unwrap_or_else(|e| e.into_inner());
-                rng.take_drawn();
-                let (latent, is_eos) = self.model.generate_step(state, input, &mut *rng)?;
-                let latent = match self.flow_type {
-                    FlowType::Drifting => self.subtract_noise(&latent, &rng.take_drawn())?,
-                    FlowType::Lsd | FlowType::FlowMatching => latent,
-                };
-                (latent, is_eos)
+                self.model.generate_step(state, input, &mut *rng)?
             };
             if is_eos && eos_step.is_none() && generation_step >= MIN_FRAMES_BEFORE_EOS {
                 eos_step = Some(generation_step);
@@ -499,34 +508,6 @@ impl<Q: CpuBackend> TtsModel<Q> {
             log::info!("Average generation step time: {mean} ms");
         }
         Ok(())
-    }
-
-    // TODO: upstream to xn-ptts. Without a drifting sampler there, the head runs as one LSD step
-    // with zeroed time embeddings (see `weights.rs`), which returns `noise + head(noise)`; the
-    // drifting sample is `head(noise)`.
-    fn subtract_noise(
-        &self,
-        latent: &Tensor<Q::T, Q::B>,
-        noise: &[f32],
-    ) -> Result<Tensor<Q::T, Q::B>> {
-        let values = latent.to_vec()?;
-        if values.len() != noise.len() {
-            bail!(
-                "drew {} noise values for a latent of {}",
-                noise.len(),
-                values.len()
-            )
-        }
-        let data = values
-            .iter()
-            .zip(noise)
-            .map(|(v, n)| Q::T::from_f32(v.to_f32() - n))
-            .collect();
-        Ok(Tensor::from_vec(
-            data,
-            latent.dims().to_vec(),
-            self.model.device(),
-        )?)
     }
 
     /// Decodes the latents as they come, as many as are queued in one call, and hands the audio
